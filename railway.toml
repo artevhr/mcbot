@@ -1,4 +1,4 @@
 [deploy]
-startCommand = "node deploy.js"
+startCommand = "node --max-old-space-size=384 index.js"
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 5
