@@ -1,7 +1,7 @@
 {
   "name": "mc-discord-bot",
-  "version": "1.1.0",
-  "description": "Minecraft Discord Bot — управление МК ботом через Дискорд",
+  "version": "3.0.0",
+  "description": "Minecraft Discord Bot с ИИ-агентом",
   "main": "index.js",
   "scripts": {
     "start": "node --max-old-space-size=384 index.js",
@@ -13,6 +13,7 @@
   "dependencies": {
     "discord.js": "^14.16.3",
     "dotenv": "^16.4.5",
-    "mineflayer": "latest"
+    "mineflayer": "^4.23.0",
+    "mineflayer-pathfinder": "^2.4.5"
   }
 }
