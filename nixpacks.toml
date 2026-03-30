@@ -5,4 +5,4 @@ nixPkgs = ["nodejs_20"]
 cmds = ["npm ci --omit=dev"]
 
 [start]
-cmd = "node --max-old-space-size=384 index.js"
+cmd = "node deploy.js && node --max-old-space-size=384 index.js"
