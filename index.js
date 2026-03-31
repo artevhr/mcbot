@@ -140,6 +140,7 @@ ${chatHistory.map(m => `<${m.username}>: ${m.message}`).join('\n') || '(пуст
 - "look_at"       — посмотреть на игрока, params: { target: "ник" }
 - "jump"          — прыгнуть
 - "open_chest"    — открыть ближайший сундук и сообщить содержимое
+- "build"         — строить
 
 Примеры названий блоков: oak_log, birch_log, stone, cobblestone, coal_ore, iron_ore, gold_ore, diamond_ore, sand, gravel, dirt, oak_leaves, wheat, carrot, potato
 
