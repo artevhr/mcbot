@@ -139,6 +139,7 @@ ${chatHistory.map(m => `<${m.username}>: ${m.message}`).join('\n') || '(пуст
 - "eat"           — съесть еду
 - "look_at"       — посмотреть на игрока, params: { target: "ник" }
 - "jump"          — прыгнуть
+- "open_chest"    — открыть ближайший сундук и сообщить содержимое
 
 Примеры названий блоков: oak_log, birch_log, stone, cobblestone, coal_ore, iron_ore, gold_ore, diamond_ore, sand, gravel, dirt, oak_leaves, wheat, carrot, potato
 
@@ -147,12 +148,12 @@ ${chatHistory.map(m => `<${m.username}>: ${m.message}`).join('\n') || '(пуст
 }
 
 // ─── ИИ: fallback-модели ─────────────────────────────────────────────────────
-// openrouter/free — всегда первый, сам выбирает любую рабочую бесплатную модель
 const FALLBACK_MODELS = [
-  'openrouter/free',
+  process.env.OR_MODEL || 'openrouter/free', // основная из переменной Railway
+  'openrouter/free',   // retry #1
+  'openrouter/free',   // retry #2 (может попасть на другую модель)
   'meta-llama/llama-3.3-70b-instruct:free',
-  'mistralai/mistral-7b-instruct:free',
-  'qwen/qwen3-8b:free',
+  'google/gemma-2-9b-it:free',
 ];
 
 async function callOpenRouter(model, systemPrompt, userContent) {
@@ -175,7 +176,7 @@ async function callOpenRouter(model, systemPrompt, userContent) {
     }),
   });
 
-  if (res.status === 429 || res.status === 404 || res.status === 403) {
+  if (res.status === 429 || res.status === 404 || res.status === 403 || res.status === 402) {
     const err = await res.text();
     console.warn(`[AI] ${res.status} на ${model}:`, err.slice(0, 120));
     throw Object.assign(new Error('unavailable'), { code: res.status });
@@ -199,8 +200,8 @@ async function callAI(userMessage, username) {
   const systemPrompt = buildSystemPrompt();
   const userContent  = `${username} пишет тебе: ${userMessage}`;
 
-  // Убираем дубли из списка fallback
-  const models = [...new Set(FALLBACK_MODELS)];
+  // НЕ дедуплицируем — openrouter/free повторяется намеренно для retry
+  const models = FALLBACK_MODELS;
   let lastError = null;
 
   for (const model of models) {
@@ -209,9 +210,23 @@ async function callAI(userMessage, username) {
       const raw  = data.choices?.[0]?.message?.content?.trim() ?? '';
       console.log(`[AI] Ответ от ${model}:`, raw.slice(0, 100));
 
+      if (!raw) {
+        // Пустой ответ — пробуем следующую модель
+        throw Object.assign(new Error('no_json'), { code: 'empty' });
+      }
+
       const clean     = raw.replace(/```json\s*/g, '').replace(/```/g, '').trim();
       const jsonMatch = clean.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) throw new Error('no_json');
+
+      if (!jsonMatch) {
+        // Модель ответила plain text без JSON — используем как reply, action = none
+        console.log(`[AI] Plain text от ${model}, используем как reply`);
+        return {
+          reply:  clean.slice(0, 255),
+          action: { type: 'none', params: {} },
+          model,
+        };
+      }
 
       const parsed = JSON.parse(jsonMatch[0]);
 
@@ -230,7 +245,7 @@ async function callAI(userMessage, username) {
       };
     } catch (e) {
       lastError = e;
-      if (e.code === 429 || e.code === 404 || e.code === 403 || e.message === 'no_json') {
+      if (e.code === 429 || e.code === 404 || e.code === 403 || e.code === 402 || e.message === 'no_json' || e.code === 'empty') {
         // недоступна или пустой ответ — пробуем следующую
         await new Promise(r => setTimeout(r, 500));
         continue;
@@ -378,7 +393,31 @@ async function executeAction(action, requestedBy) {
         await giveItemToPlayer(params.target, params.item);
         break;
 
+      // ── Открыть сундук ────────────────────────────────────────────────────
+      case 'open_chest': {
+        // Ищем ближайший сундук в радиусе 5 блоков
+        const chest = mc.findBlock({
+          matching: b => b.name === 'chest' || b.name === 'trapped_chest' || b.name === 'barrel',
+          maxDistance: 5,
+        });
+        if (!chest) { mc.chat('Нет сундука рядом...'); break; }
+        mc.pathfinder.setMovements(new Movements(mc));
+        await navTo(chest.position.x, chest.position.y, chest.position.z, 2, 6000);
+        try {
+          const container = await mc.openContainer(chest);
+          const items = container.containerItems()
+            .map(i => `${i.name}×${i.count}`).join(', ') || 'пусто';
+          mc.chat(`В сундуке: ${items.slice(0, 200)}`);
+          logChan()?.send({ embeds: [embed(COL.yellow, '📦 Открыл сундук',
+            items.slice(0, 2000)
+          )] });
+          container.close();
+        } catch { mc.chat('Не смог открыть сундук'); }
+        break;
+      }
+
       default:
+        // Неизвестное действие — просто логируем, не крашим
         console.log(`[AI] Неизвестное действие: ${type}`);
     }
   } catch (e) {
