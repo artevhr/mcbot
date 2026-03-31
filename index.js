@@ -4,7 +4,7 @@
 require('dotenv').config();
 const {
   Client, GatewayIntentBits, EmbedBuilder,
-  ActionRowBuilder, ButtonBuilder, ButtonStyle, ActivityType,
+  ActionRowBuilder, ButtonBuilder, ButtonStyle, ActivityType, MessageFlags,
 } = require('discord.js');
 const mineflayer = require('mineflayer');
 const { pathfinder, Movements, goals } = require('mineflayer-pathfinder');
@@ -146,58 +146,104 @@ ${chatHistory.map(m => `<${m.username}>: ${m.message}`).join('\n') || '(пуст
 {"reply":"текст","action":{"type":"тип","params":{}}}`;
 }
 
-// ─── ИИ: вызов OpenRouter ─────────────────────────────────────────────────────
+// ─── ИИ: fallback-модели при rate limit ──────────────────────────────────────
+// Если основная модель даёт 429 — пробуем следующие по очереди
+const FALLBACK_MODELS = [
+  process.env.OR_MODEL || 'openai/gpt-oss-120b:free',
+  'deepseek/deepseek-chat-v3-0324:free',
+  'meta-llama/llama-4-scout:free',
+  'google/gemma-3-27b-it:free',
+  'meta-llama/llama-3.3-70b-instruct:free',
+];
+
+async function callOpenRouter(model, systemPrompt, userContent) {
+  const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type':  'application/json',
+      'Authorization': `Bearer ${OR_KEY}`,
+      'HTTP-Referer':  'https://github.com/mc-discord-bot',
+      'X-Title':       'MC Discord Bot',
+    },
+    body: JSON.stringify({
+      model,
+      max_tokens:  300,
+      temperature: 0.7,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user',   content: userContent  },
+      ],
+    }),
+  });
+
+  if (res.status === 429) {
+    const err = await res.text();
+    console.warn(`[AI] 429 на ${model}:`, err.slice(0, 120));
+    throw Object.assign(new Error('rate_limited'), { code: 429 });
+  }
+
+  if (!res.ok) {
+    const err = await res.text();
+    console.error(`[AI] ${res.status} на ${model}:`, err.slice(0, 200));
+    throw new Error(`http_${res.status}`);
+  }
+
+  return res.json();
+}
+
+// ─── ИИ: вызов OpenRouter с авто-fallback ────────────────────────────────────
 async function callAI(userMessage, username) {
   if (!OR_KEY) {
     return { reply: 'ИИ не настроен — добавь OPENROUTER_API_KEY', action: { type: 'none', params: {} } };
   }
 
-  try {
-    const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${OR_KEY}`,
-        'HTTP-Referer': 'https://github.com/mc-discord-bot',
-        'X-Title': 'MC Discord Bot',
-      },
-      body: JSON.stringify({
-        model: OR_MODEL,
-        max_tokens: 300,
-        temperature: 0.7,
-        messages: [
-          { role: 'system', content: buildSystemPrompt() },
-          { role: 'user',   content: `${username} пишет тебе: ${userMessage}` },
-        ],
-      }),
-    });
+  const systemPrompt = buildSystemPrompt();
+  const userContent  = `${username} пишет тебе: ${userMessage}`;
 
-    if (!res.ok) {
-      const err = await res.text();
-      console.error('[AI] OpenRouter error:', res.status, err.slice(0, 200));
-      return { reply: 'Что-то пошло не так с ИИ...', action: { type: 'none', params: {} } };
+  // Убираем дубли из списка fallback
+  const models = [...new Set(FALLBACK_MODELS)];
+  let lastError = null;
+
+  for (const model of models) {
+    try {
+      const data = await callOpenRouter(model, systemPrompt, userContent);
+      const raw  = data.choices?.[0]?.message?.content?.trim() ?? '';
+      console.log(`[AI] Ответ от ${model}:`, raw.slice(0, 100));
+
+      const clean     = raw.replace(/```json\s*/g, '').replace(/```/g, '').trim();
+      const jsonMatch = clean.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) throw new Error('no_json');
+
+      const parsed = JSON.parse(jsonMatch[0]);
+
+      // Если использовали не основную модель — сообщаем в лог
+      if (model !== FALLBACK_MODELS[0]) {
+        console.log(`[AI] Использован fallback: ${model}`);
+        logChan()?.send({ embeds: [embed(COL.yellow, '⚠️ ИИ: fallback модель',
+          `Основная модель была недоступна (429).\nИспользовано: \`${model}\``
+        )] });
+      }
+
+      return {
+        reply:  String(parsed.reply  ?? '...').slice(0, 255),
+        action: parsed.action ?? { type: 'none', params: {} },
+        model,
+      };
+    } catch (e) {
+      lastError = e;
+      if (e.code === 429) {
+        // rate limit — пробуем следующую модель
+        await new Promise(r => setTimeout(r, 500));
+        continue;
+      }
+      // другая ошибка — логируем и пробуем следующую
+      console.error(`[AI] Ошибка ${model}:`, e.message);
+      continue;
     }
-
-    const data = await res.json();
-    const raw  = data.choices?.[0]?.message?.content?.trim() ?? '';
-    console.log('[AI] Raw response:', raw);
-
-    // Чистим от markdown-блоков если модель их добавила
-    const clean = raw.replace(/```json\s*/g, '').replace(/```/g, '').trim();
-
-    // Ищем JSON объект в ответе
-    const jsonMatch = clean.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error('No JSON in response');
-
-    const parsed = JSON.parse(jsonMatch[0]);
-    return {
-      reply:  String(parsed.reply  ?? '...').slice(0, 255),
-      action: parsed.action ?? { type: 'none', params: {} },
-    };
-  } catch (e) {
-    console.error('[AI] Parse error:', e.message);
-    return { reply: 'Хмм, не смог подумать...', action: { type: 'none', params: {} } };
   }
+
+  console.error('[AI] Все модели недоступны:', lastError?.message);
+  return { reply: 'Все ИИ-модели сейчас перегружены, попробуй чуть позже', action: { type: 'none', params: {} } };
 }
 
 // ─── ИИ: выполнение действия ──────────────────────────────────────────────────
@@ -733,7 +779,7 @@ function buildWorldEmbed() {
 }
 
 // ─── Discord: Ready ───────────────────────────────────────────────────────────
-discord.once('ready', () => {
+discord.once('clientReady', () => {
   console.log(`[Discord] ✅ ${discord.user.tag}`);
   console.log(`[AI] Модель: ${OR_MODEL}`);
   if (!OR_KEY) console.warn('[AI] ⚠️ OPENROUTER_API_KEY не задан — ИИ не будет работать');
@@ -747,7 +793,7 @@ discord.on('interactionCreate', async (interaction) => {
     else if (interaction.isButton())           await handleButton(interaction);
   } catch (e) {
     console.error('[Interaction]', e);
-    const reply = { content: `❌ Ошибка: \`${e.message}\``, ephemeral: true };
+    const reply = { content: `❌ Ошибка: \`${e.message}\``, flags: MessageFlags.Ephemeral };
     if (interaction.replied || interaction.deferred) interaction.followUp(reply).catch(() => {});
     else                                             interaction.reply(reply).catch(() => {});
   }
@@ -759,20 +805,20 @@ async function handleCommand(interaction) {
 
   // ── Подключение ──────────────────────────────────────────────────────────
   if (cmd === 'join') {
-    if (connected) return interaction.reply({ content: '❌ Бот уже в игре.', ephemeral: true });
+    if (connected) return interaction.reply({ content: '❌ Бот уже в игре.', flags: MessageFlags.Ephemeral });
     const nick = interaction.options.getString('nick');
     await interaction.reply({ embeds: [embed(COL.yellow, '⏳ Подключение...', `Захожу как \`${nick}\`...`)] });
     connectMC(nick);
     return;
   }
   if (cmd === 'leave') {
-    if (!mc || !connected) return interaction.reply({ content: '❌ Не подключён.', ephemeral: true });
+    if (!mc || !connected) return interaction.reply({ content: '❌ Не подключён.', flags: MessageFlags.Ephemeral });
     autoReconnOn = false; taskAbort = true;
     mc.quit(); mc = null; connected = false;
     return interaction.reply({ embeds: [embed(COL.red, '🔴 Отключён', 'Бот покинул сервер.')] });
   }
   if (cmd === 'reconnect') {
-    if (!mcName) return interaction.reply({ content: '❌ Нет ника. Используй `/join`.', ephemeral: true });
+    if (!mcName) return interaction.reply({ content: '❌ Нет ника. Используй `/join`.', flags: MessageFlags.Ephemeral });
     if (mc) { try { mc.quit(); } catch {} mc = null; connected = false; }
     await interaction.reply({ embeds: [embed(COL.yellow, '🔄 Реконнект', `\`${mcName}\`...`)] });
     connectMC(mcName);
@@ -781,15 +827,15 @@ async function handleCommand(interaction) {
 
   // ── Чат ──────────────────────────────────────────────────────────────────
   if (cmd === 'type') {
-    if (!mc || !connected) return interaction.reply({ content: '❌ Бот не в игре.', ephemeral: true });
+    if (!mc || !connected) return interaction.reply({ content: '❌ Бот не в игре.', flags: MessageFlags.Ephemeral });
     const message = interaction.options.getString('message');
     mc.chat(message.slice(0, 255));
     return interaction.reply({ embeds: [embed(COL.green, '✉️ Отправлено', `\`${message}\``)] });
   }
   if (cmd === 'passw') {
-    if (!mc || !connected) return interaction.reply({ content: '❌ Бот не в игре.', ephemeral: true });
+    if (!mc || !connected) return interaction.reply({ content: '❌ Бот не в игре.', flags: MessageFlags.Ephemeral });
     mc.chat(interaction.options.getString('command').slice(0, 255));
-    return interaction.reply({ embeds: [embed(COL.green, '🔑 Отправлено', '✓')], ephemeral: true });
+    return interaction.reply({ embeds: [embed(COL.green, '🔑 Отправлено', '✓')], flags: MessageFlags.Ephemeral });
   }
 
   // ── Инфо ─────────────────────────────────────────────────────────────────
@@ -801,24 +847,24 @@ async function handleCommand(interaction) {
   if (cmd === 'coords')    return interaction.reply({ embeds: [buildCoordsEmbed()] });
   if (cmd === 'near')      return interaction.reply({ embeds: [buildNearEmbed()] });
   if (cmd === 'world') {
-    if (!mc || !connected) return interaction.reply({ content: '❌ Бот не в игре.', ephemeral: true });
+    if (!mc || !connected) return interaction.reply({ content: '❌ Бот не в игре.', flags: MessageFlags.Ephemeral });
     return interaction.reply({ embeds: [buildWorldEmbed()] });
   }
 
   // ── Управление ───────────────────────────────────────────────────────────
   if (cmd === 'jump') {
-    if (!mc || !connected) return interaction.reply({ content: '❌ Бот не в игре.', ephemeral: true });
+    if (!mc || !connected) return interaction.reply({ content: '❌ Бот не в игре.', flags: MessageFlags.Ephemeral });
     mc.setControlState('jump', true);
     setTimeout(() => { if (mc) mc.setControlState('jump', false); }, 300);
     return interaction.reply({ embeds: [embed(COL.green, '⬆️ Прыжок!')] });
   }
   if (cmd === 'sneak') {
-    if (!mc || !connected) return interaction.reply({ content: '❌ Бот не в игре.', ephemeral: true });
+    if (!mc || !connected) return interaction.reply({ content: '❌ Бот не в игре.', flags: MessageFlags.Ephemeral });
     sneaking = !sneaking; mc.setControlState('sneak', sneaking);
     return interaction.reply({ embeds: [embed(COL.teal, '🕵️ Сник', sneaking ? 'Крадётся.' : 'Встал прямо.')] });
   }
   if (cmd === 'eat') {
-    if (!mc || !connected) return interaction.reply({ content: '❌ Бот не в игре.', ephemeral: true });
+    if (!mc || !connected) return interaction.reply({ content: '❌ Бот не в игре.', flags: MessageFlags.Ephemeral });
     await interaction.deferReply();
     const before = mc.food; await tryEat();
     return interaction.editReply({ embeds: [embed(COL.green, '🍗 Поел',
@@ -826,24 +872,24 @@ async function handleCommand(interaction) {
     )] });
   }
   if (cmd === 'drop') {
-    if (!mc || !connected) return interaction.reply({ content: '❌ Бот не в игре.', ephemeral: true });
+    if (!mc || !connected) return interaction.reply({ content: '❌ Бот не в игре.', flags: MessageFlags.Ephemeral });
     const itemName = interaction.options.getString('item');
     const item = mc.inventory.items().find(i => i.name.includes(itemName));
-    if (!item) return interaction.reply({ content: `❌ \`${itemName}\` не найдено.`, ephemeral: true });
+    if (!item) return interaction.reply({ content: `❌ \`${itemName}\` не найдено.`, flags: MessageFlags.Ephemeral });
     await mc.toss(item.type, null, item.count);
     return interaction.reply({ embeds: [embed(COL.orange, '🗑️ Выброшено', `**${item.name}** × ${item.count}`)] });
   }
   if (cmd === 'look') {
-    if (!mc || !connected) return interaction.reply({ content: '❌', ephemeral: true });
+    if (!mc || !connected) return interaction.reply({ content: '❌', flags: MessageFlags.Ephemeral });
     const t = mc.players[interaction.options.getString('nick')]?.entity;
-    if (!t) return interaction.reply({ content: '❌ Игрок не найден.', ephemeral: true });
+    if (!t) return interaction.reply({ content: '❌ Игрок не найден.', flags: MessageFlags.Ephemeral });
     mc.lookAt(t.position.offset(0, t.height ?? 1.8, 0));
     return interaction.reply({ embeds: [embed(COL.teal, '👀 Смотрит', `На **${interaction.options.getString('nick')}**`)] });
   }
   if (cmd === 'follow') {
-    if (!mc || !connected) return interaction.reply({ content: '❌', ephemeral: true });
+    if (!mc || !connected) return interaction.reply({ content: '❌', flags: MessageFlags.Ephemeral });
     const nick = interaction.options.getString('nick');
-    if (!mc.players[nick]) return interaction.reply({ content: '❌ Игрок не найден.', ephemeral: true });
+    if (!mc.players[nick]) return interaction.reply({ content: '❌ Игрок не найден.', flags: MessageFlags.Ephemeral });
     startFollow(nick);
     return interaction.reply({ embeds: [embed(COL.teal, '🏃 Следую', `За **${nick}**`)] });
   }
@@ -858,7 +904,7 @@ async function handleCommand(interaction) {
     if (sub === 'on') {
       if (!OR_KEY) return interaction.reply({
         content: '❌ Нет `OPENROUTER_API_KEY` — добавь переменную в Railway/`.env`',
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       aiOn = true;
       return interaction.reply({ embeds: [embed(COL.ai, '🤖 ИИ включён!',
@@ -950,10 +996,10 @@ async function handleButton(interaction) {
 
   switch (interaction.customId) {
     case 'btn_refresh':   return upd();
-    case 'btn_coords':    return interaction.reply({ embeds: [buildCoordsEmbed()],    ephemeral: true });
-    case 'btn_players':   return interaction.reply({ embeds: [buildPlayersEmbed()],   ephemeral: true });
-    case 'btn_inventory': return interaction.reply({ embeds: [buildInventoryEmbed()], ephemeral: true });
-    case 'btn_near':      return interaction.reply({ embeds: [buildNearEmbed()],      ephemeral: true });
+    case 'btn_coords':    return interaction.reply({ embeds: [buildCoordsEmbed()],    flags: MessageFlags.Ephemeral });
+    case 'btn_players':   return interaction.reply({ embeds: [buildPlayersEmbed()],   flags: MessageFlags.Ephemeral });
+    case 'btn_inventory': return interaction.reply({ embeds: [buildInventoryEmbed()], flags: MessageFlags.Ephemeral });
+    case 'btn_near':      return interaction.reply({ embeds: [buildNearEmbed()],      flags: MessageFlags.Ephemeral });
     case 'btn_leave':
       if (mc && connected) { autoReconnOn = false; taskAbort = true; mc.quit(); mc = null; connected = false; }
       return upd();
@@ -965,7 +1011,7 @@ async function handleButton(interaction) {
       autoReconnOn = !autoReconnOn; return upd();
     case 'btn_ai':
       if (!aiOn && !OR_KEY) {
-        return interaction.reply({ content: '❌ Нет `OPENROUTER_API_KEY`', ephemeral: true });
+        return interaction.reply({ content: '❌ Нет `OPENROUTER_API_KEY`', flags: MessageFlags.Ephemeral });
       }
       aiOn = !aiOn;
       if (!aiOn) { taskAbort = true; aiCooldown = false; }
