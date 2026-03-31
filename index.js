@@ -146,13 +146,12 @@ ${chatHistory.map(m => `<${m.username}>: ${m.message}`).join('\n') || '(пуст
 {"reply":"текст","action":{"type":"тип","params":{}}}`;
 }
 
-// ─── ИИ: fallback-модели при rate limit ──────────────────────────────────────
-// Если основная модель даёт 429 — пробуем следующие по очереди
+// ─── ИИ: fallback-модели при rate limit / 404 ────────────────────────────────
+// openrouter/free — сам выбирает любую рабочую бесплатную модель (самый надёжный)
 const FALLBACK_MODELS = [
   process.env.OR_MODEL || 'openai/gpt-oss-120b:free',
-  'deepseek/deepseek-chat-v3-0324:free',
-  'meta-llama/llama-4-scout:free',
-  'google/gemma-3-27b-it:free',
+  'openrouter/free',                           // авто-выбор — всегда работает
+  'nvidia/llama-3.3-nemotron-super-49b-v1:free',
   'meta-llama/llama-3.3-70b-instruct:free',
 ];
 
@@ -176,10 +175,10 @@ async function callOpenRouter(model, systemPrompt, userContent) {
     }),
   });
 
-  if (res.status === 429) {
+  if (res.status === 429 || res.status === 404) {
     const err = await res.text();
-    console.warn(`[AI] 429 на ${model}:`, err.slice(0, 120));
-    throw Object.assign(new Error('rate_limited'), { code: 429 });
+    console.warn(`[AI] ${res.status} на ${model}:`, err.slice(0, 120));
+    throw Object.assign(new Error('unavailable'), { code: res.status });
   }
 
   if (!res.ok) {
@@ -231,8 +230,8 @@ async function callAI(userMessage, username) {
       };
     } catch (e) {
       lastError = e;
-      if (e.code === 429) {
-        // rate limit — пробуем следующую модель
+      if (e.code === 429 || e.code === 404) {
+        // недоступна — пробуем следующую
         await new Promise(r => setTimeout(r, 500));
         continue;
       }
