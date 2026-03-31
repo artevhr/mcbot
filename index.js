@@ -146,13 +146,13 @@ ${chatHistory.map(m => `<${m.username}>: ${m.message}`).join('\n') || '(пуст
 {"reply":"текст","action":{"type":"тип","params":{}}}`;
 }
 
-// ─── ИИ: fallback-модели при rate limit / 404 ────────────────────────────────
-// openrouter/free — сам выбирает любую рабочую бесплатную модель (самый надёжный)
+// ─── ИИ: fallback-модели ─────────────────────────────────────────────────────
+// openrouter/free — всегда первый, сам выбирает любую рабочую бесплатную модель
 const FALLBACK_MODELS = [
-  process.env.OR_MODEL || 'openai/gpt-oss-120b:free',
-  'openrouter/free',                           // авто-выбор — всегда работает
-  'nvidia/llama-3.3-nemotron-super-49b-v1:free',
+  'openrouter/free',
   'meta-llama/llama-3.3-70b-instruct:free',
+  'mistralai/mistral-7b-instruct:free',
+  'qwen/qwen3-8b:free',
 ];
 
 async function callOpenRouter(model, systemPrompt, userContent) {
@@ -175,7 +175,7 @@ async function callOpenRouter(model, systemPrompt, userContent) {
     }),
   });
 
-  if (res.status === 429 || res.status === 404) {
+  if (res.status === 429 || res.status === 404 || res.status === 403) {
     const err = await res.text();
     console.warn(`[AI] ${res.status} на ${model}:`, err.slice(0, 120));
     throw Object.assign(new Error('unavailable'), { code: res.status });
@@ -230,8 +230,8 @@ async function callAI(userMessage, username) {
       };
     } catch (e) {
       lastError = e;
-      if (e.code === 429 || e.code === 404) {
-        // недоступна — пробуем следующую
+      if (e.code === 429 || e.code === 404 || e.code === 403 || e.message === 'no_json') {
+        // недоступна или пустой ответ — пробуем следующую
         await new Promise(r => setTimeout(r, 500));
         continue;
       }
