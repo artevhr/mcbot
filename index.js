@@ -151,9 +151,9 @@ ${chatHistory.map(m => `<${m.username}>: ${m.message}`).join('\n') || '(пуст
 const FALLBACK_MODELS = [
   process.env.OR_MODEL || 'openrouter/free', // основная из переменной Railway
   'openrouter/free',   // retry #1
-  'openrouter/free',   // retry #2 (может попасть на другую модель)
+  'stepfun/step-3.5-flash:free',
   'meta-llama/llama-3.3-70b-instruct:free',
-  'google/gemma-2-9b-it:free',
+  'z-ai/glm-4.5-air:free',
 ];
 
 async function callOpenRouter(model, systemPrompt, userContent) {
